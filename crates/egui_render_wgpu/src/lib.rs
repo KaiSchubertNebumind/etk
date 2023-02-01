@@ -223,6 +223,17 @@ impl WgpuBackend {
             surface.as_ref().unwrap().configure(device, surface_config);
         }
     }
+    pub fn register_native_texture(
+        &mut self,
+        view: &wgpu::TextureView,
+        texture_filter: wgpu::FilterMode,
+    ) -> egui::TextureId {
+        self.painter.register_native_texture(
+            &self.device,
+            view,
+            texture_filter
+        )
+    }
 }
 impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
     type Configuration = WgpuConfig;
@@ -393,6 +404,7 @@ pub struct EguiPainter {
     managed_textures: IntMap<EguiTexture>,
     #[allow(unused)]
     user_textures: IntMap<EguiTexture>,
+    next_user_texture_id: u64,
     /// textures to free
     delete_textures: Vec<TextureId>,
     draw_calls: Vec<EguiDrawCalls>,
@@ -401,8 +413,10 @@ pub struct EguiPainter {
 
 /// textures uploaded by egui are represented by this struct
 pub struct EguiTexture {
-    pub texture: Texture,
-    pub view: TextureView,
+    // None for User texture
+    pub texture: Option<Texture>,
+    // None for User texture
+    pub view: Option<TextureView>,
     pub bindgroup: BindGroup,
 }
 /// DrawCalls list so that we can just get all the work done in the pre_render stage (upload egui data)
@@ -440,8 +454,10 @@ impl EguiPainter {
                     let [x, y, width, height] = clip_rect;
                     rpass.set_scissor_rect(x, y, width, height);
                     // because webgl : Draw elements base vertex is not supported
-                    // we can't use base_vertex argument of draw_indexed. we will make sure that bound vertex buffer starts from base_vertex at zero.
+                    // we can't use base_vertex argument of draw_indexed.
+                    // We will make sure that bound vertex buffer starts from base_vertex at zero.
                     rpass.set_vertex_buffer(0, self.vb.slice(base_vertex as u64 * 20..));
+
                     match texture_id {
                         TextureId::Managed(key) => {
                             rpass.set_bind_group(
@@ -454,7 +470,17 @@ impl EguiPainter {
                                 &[],
                             );
                         }
-                        TextureId::User(_) => unimplemented!(),
+                        TextureId::User(key) => {
+                            rpass.set_bind_group(
+                                1,
+                                &self
+                                    .user_textures
+                                    .get(key)
+                                    .expect("cannot find user texture")
+                                    .bindgroup,
+                                &[],
+                            );
+                        }
                     }
                     rpass.draw_indexed(index_start..index_end, 0, 0..1);
                 }
@@ -604,6 +630,7 @@ impl EguiPainter {
             draw_calls: Vec::new(),
             custom_data: IdTypeMap::default(),
             user_textures: Default::default(),
+            next_user_texture_id: 0,
             screen_size_bindgroup_layout,
             surface_format,
         }
@@ -715,8 +742,8 @@ impl EguiPainter {
                         self.managed_textures.insert(
                             tex_id,
                             EguiTexture {
-                                texture: new_texture,
-                                view,
+                                texture: Some(new_texture),
+                                view: Some(view),
                                 bindgroup,
                             },
                         );
@@ -908,6 +935,68 @@ impl EguiPainter {
                 }
             }
         }
+    }
+
+    pub fn register_native_texture(
+        &mut self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        texture_filter: wgpu::FilterMode,
+    ) -> egui::TextureId {
+        self.register_native_texture_with_sampler_options(
+            device,
+            view,
+            wgpu::SamplerDescriptor {
+                label: Some(format!("egui_user_image_{}", self.next_user_texture_id).as_str()),
+                mag_filter: texture_filter,
+                min_filter: texture_filter,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // false positive
+    pub fn register_native_texture_with_sampler_options(
+        &mut self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        sampler_descriptor: wgpu::SamplerDescriptor<'_>,
+    ) -> egui::TextureId {
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            compare: None,
+            ..sampler_descriptor
+        });
+
+        let bindgroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(format!("egui_user_image_{}", self.next_user_texture_id).as_str()),
+            layout: &self.texture_bindgroup_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+
+                },
+            ],
+        });
+
+        let key = egui::TextureId::User(self.next_user_texture_id);
+        self.user_textures.insert(
+            self.next_user_texture_id,
+            EguiTexture {
+                texture: None,
+                view: None,
+                bindgroup,
+            },
+        );
+
+        self.next_user_texture_id += 1;
+
+        key
     }
 }
 
