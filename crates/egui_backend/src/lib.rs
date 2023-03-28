@@ -57,6 +57,16 @@ impl Default for GfxApiType {
         return Self::NoApi;
     }
 }
+/// A screen rect defining the size of the offscreen render target
+#[derive(Debug)]
+pub struct RenderTargetRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub screen_width: u32,
+    pub screen_height: u32,
+}
 
 /// This is the output from egui that renderer needs.
 /// meshes and textures_delta come from egui directly.
@@ -86,7 +96,7 @@ pub trait WindowBackend: Sized {
     type WindowType: HasRawDisplayHandle + HasRawWindowHandle + Sized;
     /// Create a new window backend. and return info needed for the GfxBackend creation and rendering
     /// config is the custom configuration of a specific window backend
-    fn new(config: Self::Configuration, backend_config: BackendConfig) -> Self;
+    fn new(config: Self::Configuration, backend_config: BackendConfig, width: u32, height: u32) -> Self;
     /// This frame's events gather into rawinput and to be presented to egui's context
     fn take_raw_input(&mut self) -> RawInput;
     /// This gives us the "Window" struct of this particular backend. should implement raw window handle apis.
@@ -143,7 +153,7 @@ pub trait GfxBackend<W: WindowBackend> {
     ///
     /// for example, a glow renderer might want an opengl context. but if the window was created without one,
     /// the glow renderer should panic.
-    fn new(window_backend: &mut W, config: Self::Configuration) -> Self;
+    fn new(window_backend: &mut W, config: Self::Configuration, use_offscreen_render_target: bool) -> Self;
 
     /// Android only. callend on app suspension, which destroys the window.
     /// so, will need to destroy the `Surface` and recreate during resume event.
@@ -167,6 +177,15 @@ pub trait GfxBackend<W: WindowBackend> {
     /// on opengl, you might call `WindowBackend::swap_buffers`.
     /// on wgpu / vulkan, you might submit commands to queues, present swapchain image etc..
     fn present(&mut self, window_backend: &mut W);
+
+    /// Check for offscreen render mode
+    fn is_rendering_to_offscreen_render_target(&self) -> bool;
+
+    /// create render target rect from screen sizes
+    fn updateRenderTargetRect(&mut self, screen_width: u32, screen_height: u32) -> (u32, u32);
+
+    /// convert screen space mouse coords to render target space
+    fn mouse_pos_screen_to_render_target_space(&self, x: f32, y: f32) -> (f32, f32);
 }
 
 /// This is the trait most users care about. just implement this trait and you can use any `WindowBackend` or `GfxBackend` to run your egui app.
@@ -218,4 +237,10 @@ pub trait UserAppData<W: WindowBackend, G: GfxBackend<W>> {
         window_backend: &mut W,
         gfx_backend: &mut G,
     ) -> egui::FullOutput;
+
+    // final composite pass using already rendered egui
+    fn run_final_pass(
+        &mut self,
+        gfx_backend: &mut G,
+    );
 }

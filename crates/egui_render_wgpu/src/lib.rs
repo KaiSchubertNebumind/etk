@@ -1,16 +1,18 @@
 use bytemuck::cast_slice;
+use egui_backend::egui::plot::Text;
 use std::borrow::Cow;
+use std::ops::Deref;
 use egui::{
     epaint::ImageDelta, util::IdTypeMap, ClippedPrimitive, Mesh, PaintCallback, PaintCallbackInfo,
     Rect, TextureId,
 };
 use egui_backend::egui;
-use egui_backend::{EguiGfxData, GfxBackend, WindowBackend};
+use egui_backend::{EguiGfxData, GfxBackend, WindowBackend, RenderTargetRect};
 use intmap::IntMap;
 use std::{
     convert::TryInto,
     num::{NonZeroU32, NonZeroU64},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tracing::{debug, info};
 pub use wgpu;
@@ -51,7 +53,7 @@ pub struct WgpuBackend {
     /// this configuration will be updated everytime we get a resize event during the `prepare_frame` fn
     pub surface_config: SurfaceConfiguration,
     /// once we acquire a swapchain image (surface texture), we will put it here.
-    surface_current_image: Option<SurfaceTexture>,
+    surface_current_texture: Option<SurfaceTexture>,
     /// we create a view for the swapchain image ^^ and set it to this field during the `prepare_frame` fn.
     /// users can assume that it will *always* be available during the `UserApp::run` fn. but don't keep any references as
     /// it will be taken and submitted during the `present_frame` method after rendering is done.
@@ -62,6 +64,81 @@ pub struct WgpuBackend {
     /// `wgpu::Queue::submit` is very expensive, so we will submit ALL command encoders at the same time during the `present_frame` method
     /// just before presenting the swapchain image (surface texture).
     pub command_encoders: Vec<CommandEncoder>,
+    /// use an offscreen render target
+    pub use_offscreen_render_target: bool,
+    /// this is an offscreen texture used for rendering egui
+    pub offscreen_render_target: Arc<Mutex<Option<RenderTarget>>>,
+    /// this is the rect the offscreen render target texture is rendered to
+    pub render_target_rect: Option<RenderTargetRect>,
+
+    last_surface_width: u32,
+    last_surface_height: u32,
+}
+
+pub struct RenderTargetSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+pub struct Percent(f32);
+
+pub struct RenderTargetFullscreenRect {
+    pub margin_top: Percent,
+    pub margin_bottom: Percent,
+    pub margin_left: Percent,
+    pub margin_right: Percent,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Vertex {
+    pub position: [f32; 3],
+    pub tex_coords: [f32; 2],
+}
+
+#[cfg(target_arch = "wasm32")]
+pub const RENDER_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+#[cfg(not(target_arch = "wasm32"))]
+pub const RENDER_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+
+const RENDER_TARGET_RECT: RenderTargetFullscreenRect =
+    RenderTargetFullscreenRect {
+        margin_top: Percent(2.0),
+        margin_bottom: Percent(5.0),
+        margin_left: Percent(7.0),
+        margin_right: Percent(44.0),
+    };
+
+pub const RENDER_TARGET_BINDGROUP_ENTRIES: [BindGroupLayoutEntry; 2] = [
+    BindGroupLayoutEntry {
+        binding: 0,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+        count: None,
+    },
+    BindGroupLayoutEntry {
+        binding: 1,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Texture {
+            sample_type: TextureSampleType::Float { filterable: true },
+            view_dimension: TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    },
+];
+
+#[derive(Debug)]
+pub struct RenderTarget {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub sampler: wgpu::Sampler,
+    pub texture_format: wgpu::TextureFormat,
+    pub bind_group_entries: [BindGroupLayoutEntry; 2],
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub bind_group: wgpu::BindGroup,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct WgpuConfig {
@@ -71,6 +148,7 @@ pub struct WgpuConfig {
     pub surface_formats_priority: Vec<TextureFormat>,
     pub surface_config: SurfaceConfiguration,
 }
+
 impl Default for WgpuConfig {
     fn default() -> Self {
         Self {
@@ -101,9 +179,11 @@ impl Default for WgpuConfig {
 }
 
 impl WgpuBackend {
+
     pub async fn new_async<W: WindowBackend>(
         window_backend: &mut W,
         config: <Self as GfxBackend<W>>::Configuration,
+        use_offscreen_render_target: bool,
     ) -> Self {
         let WgpuConfig {
             power_preference,
@@ -112,13 +192,16 @@ impl WgpuBackend {
             mut surface_config,
             backends,
         } = config;
+
         debug!("using wgpu backends: {:?}", backends);
         let instance = Arc::new(Instance::new(backends));
         debug!("iterating over all adapters");
+
         #[cfg(not(target_arch = "wasm32"))]
         for adapter in instance.enumerate_adapters(Backends::all()) {
             debug!("adapter: {:#?}", adapter.get_info());
         }
+
         let mut surface = window_backend
             .get_window()
             .map(|w| unsafe { instance.create_surface(w) });
@@ -162,6 +245,25 @@ impl WgpuBackend {
             &mut surface_config,
         );
 
+        let mut render_target_rect = None;
+
+        let offscreen_render_target =
+            if use_offscreen_render_target {
+                render_target_rect = Some(createRenderTargetRectFromScreenSize(
+                    surface_config.width,
+                    surface_config.height
+                ));
+
+                Arc::new(Mutex::new(create_offscreen_render_target(
+                    &device,
+                    render_target_rect.as_ref().unwrap().width,
+                    render_target_rect.as_ref().unwrap().height,
+                    "render target texture",
+                )))
+            } else {
+                Arc::new(Mutex::new(None))
+            };
+
         let painter = EguiPainter::new(&device, surface_config.format);
 
         Self {
@@ -171,13 +273,48 @@ impl WgpuBackend {
             queue,
             painter,
             surface,
+            surface_formats_priority,
             surface_config,
             surface_view: None,
-            surface_current_image: None,
+            surface_current_texture: None,
             command_encoders: Vec::new(),
-            surface_formats_priority,
+            use_offscreen_render_target,
+            offscreen_render_target,
+            render_target_rect,
+            last_surface_height: framebuffer_size[1],
+            last_surface_width: framebuffer_size[0],
         }
     }
+
+    pub fn resize_render_target<W: WindowBackend>(&mut self, width: u32, height: u32) {
+        let do_resize =
+            self.last_surface_height != height ||
+            self.last_surface_width != width;
+
+        if do_resize {
+            self.last_surface_height = height;
+            self.last_surface_width = width;
+
+            if self.use_offscreen_render_target {
+                let (width, height) = <WgpuBackend as GfxBackend<W>>::updateRenderTargetRect(
+                    self,
+                    width,
+                    height,
+                );
+
+                let mut render_target =
+                    self.offscreen_render_target.lock().unwrap();
+
+                *render_target = create_offscreen_render_target(
+                    &self.device,
+                    width,
+                    height,
+                    "render target texture",
+                );
+            }
+        }
+    }
+
     /// This basically checks if the surface needs creating. and then if needed, creates surface if window exists.
     /// then, it does all the work of configuring the surface.
     /// this is used during resume events to create a surface.
@@ -223,6 +360,7 @@ impl WgpuBackend {
             surface.as_ref().unwrap().configure(device, surface_config);
         }
     }
+
     pub fn register_native_texture(
         &mut self,
         view: &wgpu::TextureView,
@@ -234,17 +372,30 @@ impl WgpuBackend {
             texture_filter
         )
     }
+
+    pub fn createRenderTargetRectFromScreenSize(&self, screen_width: u32, screen_height: u32) -> RenderTargetRect {
+        createRenderTargetRectFromScreenSize(screen_width, screen_height)
+    }
 }
+
 impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
     type Configuration = WgpuConfig;
 
-    fn new(window_backend: &mut W, config: Self::Configuration) -> Self {
-        pollster::block_on(Self::new_async(window_backend, config))
+    fn new(
+        window_backend: &mut W,
+        config: Self::Configuration,
+        use_offscreen_render_target: bool,
+    ) -> Self {
+        pollster::block_on(Self::new_async(
+            window_backend,
+            config,
+            use_offscreen_render_target
+        ))
     }
 
     fn suspend(&mut self, _window_backend: &mut W) {
         self.surface = None;
-        self.surface_current_image = None;
+        self.surface_current_texture = None;
         self.surface_view = None;
     }
 
@@ -260,6 +411,8 @@ impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
         );
         self.painter
             .on_resume(&self.device, self.surface_config.format);
+
+        self.resize_render_target::<W>(self.surface_config.width, self.surface_config.height);
     }
 
     fn prepare_frame(&mut self, framebuffer_size_update: bool, window_backend: &mut W) {
@@ -271,11 +424,15 @@ impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
                 .as_ref()
                 .unwrap()
                 .configure(&self.device, &self.surface_config);
+
+            self.resize_render_target::<W>(self.surface_config.width, self.surface_config.height);
         }
-        assert!(self.surface_current_image.is_none());
+
+        assert!(self.surface_current_texture.is_none());
         assert!(self.surface_view.is_none());
+
         if let Some(surface) = self.surface.as_ref() {
-            let current_surface_image = surface.get_current_texture().unwrap_or_else(|e| {
+            let current_surface_texture = surface.get_current_texture().unwrap_or_else(|e| {
                 let phy_fb_size = window_backend.get_live_physical_size_framebuffer().unwrap();
                 self.surface_config.width = phy_fb_size[0];
                 self.surface_config.height = phy_fb_size[1];
@@ -284,7 +441,7 @@ impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
                     "failed to get surface even after reconfiguration. {e}"
                 ))
             });
-            let surface_view = current_surface_image
+            let surface_view = current_surface_texture
                 .texture
                 .create_view(&TextureViewDescriptor {
                     label: Some("surface view"),
@@ -298,41 +455,83 @@ impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
                 });
 
             self.surface_view = Some(surface_view);
-            self.surface_current_image = Some(current_surface_image);
+            self.surface_current_texture = Some(current_surface_texture);
         }
     }
 
     fn render(&mut self, egui_gfx_data: EguiGfxData) {
+        let screen_size = if self.use_offscreen_render_target {
+            [
+                self.render_target_rect.as_ref().unwrap().width,
+                self.render_target_rect.as_ref().unwrap().height,
+            ]
+        } else {
+            [self.surface_config.width, self.surface_config.height]
+        };
+
         self.painter.upload_egui_data(
             &self.device,
             &self.queue,
             egui_gfx_data,
-            [self.surface_config.width, self.surface_config.height],
+            screen_size,
         );
-        let mut command_encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("egui command encoder"),
-            });
+
+        let mut render_pass_closure = |view| {
+            let mut command_encoder =
+                self
+                    .device
+                    .create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("egui command encoder"),
+                    });
+            {
+                let mut egui_pass = command_encoder.begin_render_pass(
+                    &RenderPassDescriptor {
+                        label: Some("egui render pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: true,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                    }
+                );
+                self.painter.draw_egui_with_renderpass(&mut egui_pass);
+            }
+
+            self.command_encoders.push(command_encoder);
+        };
+
         {
-            let mut egui_pass = command_encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("egui render pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: self
+            let guard =
+                self
+                    .offscreen_render_target
+                    .lock()
+                    .unwrap();
+
+            if guard
+                .deref()
+                .is_none()
+            {
+                let view =
+                    self
                         .surface_view
                         .as_ref()
-                        .expect("failed ot get surface view for egui render pass creation"),
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-            self.painter.draw_egui_with_renderpass(&mut egui_pass);
+                        .expect("failed ot get surface view for egui render pass creation");
+
+                render_pass_closure(view);
+            } else {
+                let view =
+                    &guard
+                        .as_ref()
+                        .unwrap()
+                        .view;
+
+                render_pass_closure(view);
+            }
         }
-        self.command_encoders.push(command_encoder);
     }
 
     fn present(&mut self, _window_backend: &mut W) {
@@ -341,16 +540,198 @@ impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
                 .into_iter()
                 .map(|encoder| encoder.finish()),
         );
-        {
+
+        let guard =
+                self
+                    .offscreen_render_target
+                    .lock()
+                    .unwrap();
+
+        { // leaves None in self.surface_view
             self.surface_view
                 .take()
                 .expect("failed to get surface view to present");
         }
-        self.surface_current_image
+        // leaves None in self.surface_current_texture
+        self.surface_current_texture
             .take()
             .expect("failed to surface texture to preset")
             .present();
     }
+
+    fn is_rendering_to_offscreen_render_target(&self) -> bool {
+        self.use_offscreen_render_target
+    }
+
+    fn updateRenderTargetRect(&mut self, screen_width: u32, screen_height: u32) -> (u32, u32) {
+        self.render_target_rect = Some(createRenderTargetRectFromScreenSize(screen_width, screen_height));
+        let rect = self.render_target_rect.as_ref().unwrap();
+        (rect.width, rect.height)
+    }
+
+    fn mouse_pos_screen_to_render_target_space(&self, x: f32, y: f32) -> (f32, f32) {
+        let (x, y) = if self.use_offscreen_render_target {
+            let rect = self.render_target_rect.as_ref().unwrap();
+            (x - rect.x as f32, y - rect.y as f32)
+        } else {
+            (x, y)
+        };
+
+        (x, y)
+    }
+}
+
+pub fn create_offscreen_render_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Option<RenderTarget> {
+
+    let texture_format = RENDER_TARGET_FORMAT;
+    let bind_group_entries = RENDER_TARGET_BINDGROUP_ENTRIES;
+
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+
+    let desc = wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: texture_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+    };
+    let texture = device.create_texture(&desc);
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(
+        &wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            compare: None,
+            lod_min_clamp: -100.0,
+            lod_max_clamp: 100.0,
+            ..Default::default()
+        }
+    );
+
+    let bind_group_layout = device.create_bind_group_layout(
+        &wgpu::BindGroupLayoutDescriptor {
+            entries: &bind_group_entries,
+            label: Some("render_target_bind_group_layout"),
+        }
+    );
+    let bind_group = device.create_bind_group(
+        &wgpu::BindGroupDescriptor {
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+            ],
+            label: Some("color_render_target.bind_group"),
+        }
+    );
+
+    Some(RenderTarget{
+        texture,
+        view,
+        sampler,
+        texture_format,
+        bind_group_entries,
+        bind_group_layout,
+        bind_group,
+        width,
+        height,
+    })
+}
+
+pub fn createRenderTargetRectFromScreenSize(
+    screen_width: u32,
+    screen_height: u32
+) -> RenderTargetRect {
+    let width_percent = screen_width as f32 / 100.0;
+    let height_percent = screen_height as f32 / 100.0;
+
+    let x = width_percent * RENDER_TARGET_RECT.margin_left.0;
+    let width =
+        width_percent *
+            (100.0
+                - RENDER_TARGET_RECT.margin_left.0
+                - RENDER_TARGET_RECT.margin_right.0
+            );
+
+    let y = height_percent * RENDER_TARGET_RECT.margin_top.0;
+    let height =
+        height_percent *
+            (100.0
+                - RENDER_TARGET_RECT.margin_top.0
+                - RENDER_TARGET_RECT.margin_bottom.0
+            );
+
+    RenderTargetRect {
+        x: x as u32,
+        y: y as u32,
+        width: width as u32,
+        height: height as u32,
+        screen_width,
+        screen_height,
+    }
+}
+
+pub fn create_fullscreen_vertices() -> [Vertex; 4] {
+    // clip space goes from -1.0 to 1.0 on each axis
+    // so total length of an axis is 2.0
+    // so one percent is 0.02
+    let percent = 0.02f32;
+
+    let top_left_x = -1.0 + percent * RENDER_TARGET_RECT.margin_left.0;
+    let top_left_y = 1.0 - percent * RENDER_TARGET_RECT.margin_top.0;
+
+    let bottom_left_x = top_left_x;
+    let bottom_left_y = -1.0 + percent * RENDER_TARGET_RECT.margin_bottom.0;
+
+    let top_right_x = 1.0 - percent * RENDER_TARGET_RECT.margin_right.0;
+    let top_right_y = top_left_y;
+
+    let bottom_right_x = top_right_x;
+    let bottom_right_y = bottom_left_y;
+
+    let vertices = [
+        Vertex {
+            position: [bottom_left_x, bottom_left_y, 0.0],
+            tex_coords: [0.0, 1.0],
+        },
+        Vertex {
+            position: [bottom_right_x, bottom_right_y, 0.0],
+            tex_coords: [1.0, 1.0],
+        },
+        Vertex {
+            position: [top_right_x, top_right_y, 0.0],
+            tex_coords: [1.0, 0.0],
+        },
+        Vertex {
+            position: [top_left_x, top_left_y, 0.0],
+            tex_coords: [0.0, 0.0],
+        },
+    ];
+
+    vertices
 }
 
 pub const EGUI_SHADER_SRC: &str = include_str!("../../../shaders/egui.wgsl");
@@ -434,6 +815,7 @@ pub enum EguiDrawCalls {
         paint_callback: PaintCallback,
     },
 }
+
 impl EguiPainter {
     pub fn draw_egui_with_renderpass<'rpass>(&'rpass mut self, rpass: &mut RenderPass<'rpass>) {
         // rpass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
@@ -442,6 +824,7 @@ impl EguiPainter {
 
         rpass.set_vertex_buffer(0, self.vb.slice(..));
         rpass.set_index_buffer(self.ib.slice(..), IndexFormat::Uint32);
+
         for draw_call in self.draw_calls.iter() {
             match draw_call {
                 &EguiDrawCalls::Mesh {
@@ -556,6 +939,7 @@ impl EguiPainter {
         });
         egui_pipeline
     }
+
     pub fn new(dev: &Device, surface_format: TextureFormat) -> Self {
         // create uniform buffer for screen size
         let screen_size_buffer = dev.create_buffer(&BufferDescriptor {
@@ -635,6 +1019,7 @@ impl EguiPainter {
             surface_format,
         }
     }
+
     fn on_resume(&mut self, dev: &Device, surface_format: TextureFormat) {
         if self.surface_format != surface_format {
             self.pipeline = Self::create_render_pipeline(
@@ -645,6 +1030,7 @@ impl EguiPainter {
             );
         }
     }
+
     fn set_textures(
         &mut self,
         dev: &Device,
@@ -785,6 +1171,7 @@ impl EguiPainter {
             // upload textures
             self.set_textures(dev, queue, textures_delta.set);
         }
+
         // update screen size uniform buffer
         queue.write_buffer(
             &self.screen_size_buffer,
@@ -852,6 +1239,7 @@ impl EguiPainter {
                     clip_rect,
                     primitive,
                 } = clipped_primitive;
+
                 // copy paste from official egui impl because i have no idea what this is :D
                 let clip_min_x = scale * clip_rect.min.x;
                 let clip_min_y = scale * clip_rect.min.y;
@@ -898,17 +1286,19 @@ impl EguiPainter {
                         index_buffer_mut[ib_offset..new_ib_offset]
                             .copy_from_slice(cast_slice(&indices));
                         // record draw call
-                        self.draw_calls.push(EguiDrawCalls::Mesh {
-                            clip_rect: scissor_rect,
-                            texture_id,
-                            // vertex buffer offset is in bytes. so, we divide by size to get the "nth" vertex to use as base
-                            base_vertex: (vb_offset / 20)
-                                .try_into()
-                                .expect("failed to fit vertex buffer offset into i32"),
-                            // ib offset is in bytes. divided by index size, we get the starting and ending index to use for this draw call
-                            index_start: (ib_offset / 4) as u32,
-                            index_end: (new_ib_offset / 4) as u32,
-                        });
+                        self.draw_calls.push(
+                            EguiDrawCalls::Mesh {
+                                clip_rect: scissor_rect,
+                                texture_id,
+                                // vertex buffer offset is in bytes. so, we divide by size to get the "nth" vertex to use as base
+                                base_vertex: (vb_offset / 20)
+                                    .try_into()
+                                    .expect("failed to fit vertex buffer offset into i32"),
+                                // ib offset is in bytes. divided by index size, we get the starting and ending index to use for this draw call
+                                index_start: (ib_offset / 4) as u32,
+                                index_end: (new_ib_offset / 4) as u32,
+                            }
+                        );
                         // set end offsets as start offsets for next iteration
                         vb_offset = new_vb_offset;
                         ib_offset = new_ib_offset;
@@ -918,19 +1308,21 @@ impl EguiPainter {
                             .downcast_ref::<CallbackFn>()
                             .expect("failed to downcast egui callback fn")
                             .prepare)(dev, queue, &mut self.custom_data);
-                        self.draw_calls.push(EguiDrawCalls::Callback {
-                            clip_rect: scissor_rect,
-                            paint_callback: cb,
-                            paint_callback_info: PaintCallbackInfo {
-                                viewport: Rect::from_min_size(
-                                    Default::default(),
-                                    screen_size_logical.into(),
-                                ),
-                                clip_rect,
-                                pixels_per_point: scale,
-                                screen_size_px: screen_size_physical,
-                            },
-                        });
+                        self.draw_calls.push(
+                            EguiDrawCalls::Callback {
+                                clip_rect: scissor_rect,
+                                paint_callback: cb,
+                                paint_callback_info: PaintCallbackInfo {
+                                    viewport: Rect::from_min_size(
+                                        Default::default(),
+                                        screen_size_logical.into(),
+                                    ),
+                                    clip_rect,
+                                    pixels_per_point: scale,
+                                    screen_size_px: screen_size_physical,
+                                },
+                            }
+                        );
                     }
                 }
             }

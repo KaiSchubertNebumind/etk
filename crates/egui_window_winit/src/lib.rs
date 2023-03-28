@@ -2,6 +2,7 @@ use egui::{DroppedFile, Event, Key, Modifiers, Rect};
 use egui_backend::egui::RawInput;
 use egui_backend::*;
 pub use winit;
+use winit::dpi::PhysicalSize;
 use winit::{event::MouseButton, window::WindowBuilder, *};
 use winit::{
     event::{ModifiersState, VirtualKeyCode},
@@ -72,21 +73,28 @@ impl WindowBackend for WinitBackend {
     type Configuration = WinitConfig;
     type WindowType = winit::window::Window;
 
-    fn new(config: Self::Configuration, backend_config: BackendConfig) -> Self {
-        let mut event_loop = winit::event_loop::EventLoopBuilder::with_user_event();
+    fn new(
+        config: Self::Configuration,
+        backend_config: BackendConfig,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let mut event_loop_builder = winit::event_loop::EventLoopBuilder::with_user_event();
 
         #[cfg(target_os = "android")]
         use winit::platform::android::EventLoopBuilderExtAndroid;
         #[cfg(target_os = "android")]
         let event_loop = event_loop.with_android_app(config.android_app);
 
-        let el = event_loop.build();
+        let event_loop = event_loop_builder.build();
         tracing::info!("this is loggging");
 
         #[allow(unused_mut)]
-        let mut window_builder = WindowBuilder::new()
-            .with_resizable(true)
-            .with_title(&config.title);
+        let mut window_builder =
+            WindowBuilder::new()
+                .with_inner_size(PhysicalSize::new(width, height))
+                .with_resizable(true)
+                .with_title(&config.title);
 
         #[cfg(target_arch = "wasm32")]
         let window = {
@@ -105,7 +113,7 @@ impl WindowBackend for WinitBackend {
             // create winit window
             let window = window_builder
                 .clone()
-                .build(&el)
+                .build(&event_loop)
                 .expect("failed to create winit window");
 
             Some(window)
@@ -116,7 +124,7 @@ impl WindowBackend for WinitBackend {
         let window = Some(
             window_builder
                 .clone()
-                .build(&el)
+                .build(&event_loop)
                 .expect("failed ot create winit window"),
         );
 
@@ -128,7 +136,7 @@ impl WindowBackend for WinitBackend {
         let raw_input = RawInput::default();
 
         Self {
-            event_loop: Some(el),
+            event_loop: Some(event_loop),
             window: window,
             modifiers: Modifiers::default(),
             framebuffer_size,
@@ -214,10 +222,28 @@ impl WindowBackend for WinitBackend {
                             .scale_factor() as f32;
                         let window_size =
                             framebuffer_size_physical.to_logical::<f32>(self.scale as f64);
+
+                        let screen_size = if gfx_backend.is_rendering_to_offscreen_render_target() {
+                            let (width, height) = gfx_backend.updateRenderTargetRect(
+                                window_size.width as u32,
+                                window_size.height as u32,
+                            );
+                            [
+                                width as f32,
+                                height as f32
+                            ]
+
+                        } else {
+                            [
+                                window_size.width,
+                                window_size.height
+                            ]
+                        };
+
                         self.raw_input = RawInput {
                             screen_rect: Some(Rect::from_two_pos(
                                 [0.0, 0.0].into(),
-                                [window_size.width, window_size.height].into(),
+                                screen_size.into(),
                             )),
                             pixels_per_point: Some(self.scale),
                             ..Default::default()
@@ -233,30 +259,63 @@ impl WindowBackend for WinitBackend {
                             // take egui input
                             let input = self.take_raw_input();
                             // prepare surface for drawing
-                            gfx_backend.prepare_frame(self.latest_resize_event, &mut self);
+                            gfx_backend.prepare_frame(
+                                self.latest_resize_event,
+                                &mut self
+                            );
                             self.latest_resize_event = false;
                             // begin egui with input
-
                             // run userapp gui function. let user do anything he wants with window or gfx backends
                             let output =
-                                user_app.run(&egui_context, input, &mut self, &mut gfx_backend);
+                                user_app.run(
+                                    &egui_context,
+                                    input,
+                                    &mut self,
+                                    &mut gfx_backend
+                                );
+
+                            let screen_size_logical = if gfx_backend.is_rendering_to_offscreen_render_target() {
+                                let (width, height) = gfx_backend.updateRenderTargetRect(
+                                    self.framebuffer_size[0],
+                                    self.framebuffer_size[1]
+                                );
+                                [
+                                    width as f32 / self.scale,
+                                    height as f32 / self.scale,
+                                ]
+                            } else {
+                                [
+                                    self.framebuffer_size[0] as f32 / self.scale,
+                                    self.framebuffer_size[1] as f32 / self.scale,
+                                ]
+                            };
 
                             // prepare egui render data for gfx backend
                             let egui_gfx_data = EguiGfxData {
                                 meshes: egui_context.tessellate(output.shapes),
                                 textures_delta: output.textures_delta,
-                                screen_size_logical: [
-                                    self.framebuffer_size[0] as f32 / self.scale,
-                                    self.framebuffer_size[1] as f32 / self.scale,
-                                ],
+                                screen_size_logical,
                             };
-                            // render egui with gfx backend
-                            gfx_backend.render(egui_gfx_data);
+
+                            if gfx_backend.is_rendering_to_offscreen_render_target() {
+                                // render egui with gfx backend first
+                                gfx_backend.render(egui_gfx_data);
+
+                                // render final pass of user app using already rendered egui second
+                                user_app.run_final_pass(&mut gfx_backend);
+                            } else {
+                                // render final pass of user app first
+                                user_app.run_final_pass(&mut gfx_backend);
+
+                                // render egui with gfx backend on top of final 3D pass
+                                gfx_backend.render(egui_gfx_data);
+                            }
+
                             // present the frame and loop back
                             gfx_backend.present(&mut self);
                         }
                     }
-                    rest => self.handle_event(rest),
+                    rest => self.handle_event(rest, &mut gfx_backend),
                 }
                 if self.should_close {
                     *control_flow = ControlFlow::Exit;
@@ -279,14 +338,35 @@ impl WindowBackend for WinitBackend {
 }
 
 impl WinitBackend {
-    fn handle_event(&mut self, event: winit::event::Event<()>) {
+    fn handle_event<G: GfxBackend<Self> + 'static> (
+        &mut self,
+        event: winit::event::Event<()>,
+        gfx_backend: &mut G,
+    ) {
         if let Some(egui_event) = match event {
             event::Event::WindowEvent { event, .. } => match event {
                 event::WindowEvent::Resized(size) => {
-                    let logical_size = size.to_logical::<f32>(self.scale as f64);
+                    let logical_size = if gfx_backend.is_rendering_to_offscreen_render_target() {
+                        let (width, height) = gfx_backend.updateRenderTargetRect(
+                            size.width,
+                            size.height
+                        );
+                        [
+                            width as f32 / self.scale,
+                            height as f32 / self.scale,
+                        ]
+
+                    } else {
+                        [
+                            size.width as f32 / self.scale,
+                            size.height as f32 / self.scale,
+                        ]
+                    };
+
+
                     self.raw_input.screen_rect = Some(Rect::from_two_pos(
                         Default::default(),
-                        [logical_size.width, logical_size.height].into(),
+                        [logical_size[0], logical_size[1]].into(),
                     ));
                     self.latest_resize_event = true;
                     self.framebuffer_size = size.into();
@@ -338,8 +418,9 @@ impl WinitBackend {
                 }
                 event::WindowEvent::CursorMoved { position, .. } => {
                     let logical = position.to_logical::<f32>(self.scale as f64);
-                    self.cursor_pos_logical = [logical.x, logical.y];
-                    Some(Event::PointerMoved([logical.x, logical.y].into()))
+                    let (x, y) = gfx_backend.mouse_pos_screen_to_render_target_space(logical.x, logical.y);
+                    self.cursor_pos_logical = [x, y];
+                    Some(Event::PointerMoved([x, y].into()))
                 }
                 event::WindowEvent::CursorLeft { .. } => Some(Event::PointerGone),
                 event::WindowEvent::MouseWheel { delta, .. } => match delta {
@@ -374,12 +455,15 @@ impl WinitBackend {
                 }
                 event::WindowEvent::Touch(touch) => {
                     // code stolen from eframe(egui-winit).
+
+
                     let pos = egui::pos2(
                         touch.location.x as f32 / self.scale,
                         touch.location.y as f32 / self.scale,
                     );
                     tracing::warn!("touch event: {} {}", touch.location.x, touch.location.y);
                     self.cursor_pos_logical = [pos.x, pos.y];
+
                     if self.pointer_touch_id.is_none() || self.pointer_touch_id.unwrap() == touch.id
                     {
                         // … emit PointerButton resp. PointerMoved events to emulate mouse
