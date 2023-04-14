@@ -67,6 +67,8 @@ pub struct WinitBackend {
     pub should_close: bool,
     pub backend_config: BackendConfig,
     pub window_builder: WindowBuilder,
+    pub winit_config: WinitConfig,
+    last_canvas_parent_size: (i32, i32),
 }
 
 impl WindowBackend for WinitBackend {
@@ -74,7 +76,7 @@ impl WindowBackend for WinitBackend {
     type WindowType = winit::window::Window;
 
     fn new(
-        config: Self::Configuration,
+        winit_config: Self::Configuration,
         backend_config: BackendConfig,
         width: u32,
         height: u32,
@@ -84,7 +86,7 @@ impl WindowBackend for WinitBackend {
         #[cfg(target_os = "android")]
         use winit::platform::android::EventLoopBuilderExtAndroid;
         #[cfg(target_os = "android")]
-        let event_loop = event_loop.with_android_app(config.android_app);
+        let event_loop = event_loop.with_android_app(winit_config.android_app);
 
         let event_loop = event_loop_builder.build();
         tracing::info!("this is loggging");
@@ -92,9 +94,9 @@ impl WindowBackend for WinitBackend {
         #[allow(unused_mut)]
         let mut window_builder =
             WindowBuilder::new()
-                .with_inner_size(PhysicalSize::new(width, height))
+                //.with_inner_size(PhysicalSize::new(width, height))
                 .with_resizable(true)
-                .with_title(&config.title);
+                .with_title(&winit_config.title);
 
         #[cfg(target_arch = "wasm32")]
         let window = {
@@ -103,10 +105,10 @@ impl WindowBackend for WinitBackend {
                 .document()
                 .expect("failed to get websys doc");
             tracing::info!("this is web loggging");
-            let canvas = config.dom_element_id.map(|canvas_id| {
+            let canvas = winit_config.dom_element_id.as_ref().map(|canvas_id| {
                     document
                         .get_element_by_id(&canvas_id)
-                        .expect("config doesn't contain canvas and DOM doesn't have a canvas element either")
+                        .expect("winit_config doesn't contain canvas and DOM doesn't have a canvas element either")
                         .dyn_into::<web_sys::HtmlCanvasElement>().expect("failed to get canvas converted into html canvas element")
                 });
             window_builder = window_builder.with_canvas(canvas);
@@ -135,6 +137,11 @@ impl WindowBackend for WinitBackend {
         let scale = 1.0;
         let raw_input = RawInput::default();
 
+        let last_canvas_parent_size = resize_canvas_to_parent(
+            (0, 0),
+            winit_config.dom_element_id.as_ref().unwrap()
+        ).unwrap();
+
         Self {
             event_loop: Some(event_loop),
             window: window,
@@ -149,6 +156,8 @@ impl WindowBackend for WinitBackend {
             backend_config,
             window_builder,
             pointer_touch_id: None,
+            winit_config,
+            last_canvas_parent_size,
         }
     }
 
@@ -176,6 +185,7 @@ impl WindowBackend for WinitBackend {
     ) {
         let egui_context = egui::Context::default();
         let mut suspended = true;
+
         self.event_loop.take().expect("event loop missing").run(
             move |event, _event_loop, control_flow| {
                 *control_flow = ControlFlow::Poll;
@@ -256,8 +266,15 @@ impl WindowBackend for WinitBackend {
                     }
                     event::Event::RedrawRequested(_) => {
                         if !suspended {
+                            tracing::info!("event::Event::RedrawRequested");
                             // take egui input
                             let input = self.take_raw_input();
+
+                            self.last_canvas_parent_size = resize_canvas_to_parent(
+                                self.last_canvas_parent_size,
+                                self.winit_config.dom_element_id.as_ref().unwrap()
+                            ).unwrap();
+
                             // prepare surface for drawing
                             gfx_backend.prepare_frame(
                                 self.latest_resize_event,
@@ -346,6 +363,8 @@ impl WinitBackend {
         if let Some(egui_event) = match event {
             event::Event::WindowEvent { event, .. } => match event {
                 event::WindowEvent::Resized(size) => {
+                    tracing::warn!("Resized");
+
                     let logical_size = if gfx_backend.is_rendering_to_offscreen_render_target() {
                         let (width, height) = gfx_backend.updateRenderTargetRect(
                             size.width,
@@ -362,6 +381,8 @@ impl WinitBackend {
                             size.height as f32 / self.scale,
                         ]
                     };
+
+                    tracing::warn!("Resized {:?}", logical_size);
 
 
                     self.raw_input.screen_rect = Some(Rect::from_two_pos(
@@ -419,7 +440,9 @@ impl WinitBackend {
                 event::WindowEvent::CursorMoved { position, .. } => {
                     let logical = position.to_logical::<f32>(self.scale as f64);
                     let (x, y) = gfx_backend.mouse_pos_screen_to_render_target_space(logical.x, logical.y);
+
                     self.cursor_pos_logical = [x, y];
+                    //tracing::warn!("Cursor moved x, y {} {}", x, y);
                     Some(Event::PointerMoved([x, y].into()))
                 }
                 event::WindowEvent::CursorLeft { .. } => Some(Event::PointerGone),
@@ -629,4 +652,78 @@ fn winit_key_to_egui(key_code: VirtualKeyCode) -> Option<Key> {
         _ => return None,
     };
     Some(key)
+}
+
+fn resize_canvas_to_parent(last_size: (i32, i32), canvas_id: &str /*, max_size_points: egui::Vec2*/) -> Option<(i32, i32)> {
+    let canvas = canvas_element(canvas_id)?;
+    let parent = canvas.parent_element()?;
+
+    let width = parent.client_width();
+    let height = parent.client_height();
+
+    // no change in resolution
+    if last_size.0 == width && last_size.1 == height {
+        return Some((width, height));
+    }
+
+    tracing::info!("resize_canvas_to_parent {}, {}", width, height);
+
+    let canvas_real_size = egui::Vec2 {
+        x: width as f32,
+        y: height as f32,
+    };
+
+    if width <= 0 || height <= 0 {
+        tracing::error!("egui canvas parent size is {}x{}. Try adding `html, body {{ height: 100%; width: 100% }}` to your CSS!", width, height);
+    }
+
+    let pixels_per_point = native_pixels_per_point();
+
+    //let max_size_pixels = pixels_per_point * max_size_points;
+
+    let canvas_size_pixels = canvas_real_size * pixels_per_point;
+    //let canvas_size_pixels = canvas_size_pixels.min(max_size_pixels);
+    let canvas_size_points = canvas_size_pixels / pixels_per_point;
+
+    // Make sure that the height and width are always even numbers.
+    // otherwise, the page renders blurry on some platforms.
+    // See https://github.com/emilk/egui/issues/103
+    fn round_to_even(v: f32) -> f32 {
+        (v / 2.0).round() * 2.0
+    }
+
+    canvas
+        .style()
+        .set_property(
+            "width",
+            &format!("{}px", round_to_even(canvas_size_points.x)),
+        )
+        .ok()?;
+    canvas
+        .style()
+        .set_property(
+            "height",
+            &format!("{}px", round_to_even(canvas_size_points.y)),
+        )
+        .ok()?;
+    canvas.set_width(round_to_even(canvas_size_pixels.x) as u32);
+    canvas.set_height(round_to_even(canvas_size_pixels.y) as u32);
+
+    Some((width, height))
+}
+
+pub fn canvas_element(canvas_id: &str) -> Option<web_sys::HtmlCanvasElement> {
+    use wasm_bindgen::JsCast;
+    let document = web_sys::window()?.document()?;
+    let canvas = document.get_element_by_id(canvas_id)?;
+    canvas.dyn_into::<web_sys::HtmlCanvasElement>().ok()
+}
+
+pub fn native_pixels_per_point() -> f32 {
+    let pixels_per_point = web_sys::window().unwrap().device_pixel_ratio() as f32;
+    if pixels_per_point > 0.0 && pixels_per_point.is_finite() {
+        pixels_per_point
+    } else {
+        1.0
+    }
 }
