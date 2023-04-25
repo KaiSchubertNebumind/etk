@@ -12,7 +12,7 @@ use winit::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
-use winit::platform::web::{WindowBuilderExtWebSys, WindowExtWebSys};
+use winit::platform::web::{WindowBuilderExtWebSys};
 
 /// config that you provide to winit backend
 #[derive(Debug)]
@@ -187,7 +187,11 @@ impl WindowBackend for WinitBackend {
         let mut suspended = true;
 
         self.event_loop.take().expect("event loop missing").run(
-            move |event, _event_loop, control_flow| {
+            move |
+                event,
+                _event_loop,
+                control_flow
+            | {
                 *control_flow = ControlFlow::Poll;
 
                 match event {
@@ -267,13 +271,32 @@ impl WindowBackend for WinitBackend {
                     event::Event::RedrawRequested(_) => {
                         if !suspended {
                             tracing::info!("event::Event::RedrawRequested");
-                            // take egui input
-                            let input = self.take_raw_input();
 
-                            self.last_canvas_parent_size = resize_canvas_to_parent(
+                            let last_canvas_parent_size = resize_canvas_to_parent(
                                 self.last_canvas_parent_size,
                                 self.winit_config.dom_element_id.as_ref().unwrap()
-                            ).unwrap();
+                            );
+
+                            if last_canvas_parent_size.is_some() {
+                                self.last_canvas_parent_size = last_canvas_parent_size.unwrap();
+                                let event = event::Event::WindowEvent{
+                                    window_id: self.window.as_ref().unwrap().id(),
+                                    event: event::WindowEvent::Resized(
+                                        PhysicalSize {
+                                            width: self.last_canvas_parent_size.0 as u32,
+                                            height: self.last_canvas_parent_size.1 as u32,
+                                        }
+                                    )
+                                };
+
+                                self.handle_event(
+                                    event,
+                                    &mut gfx_backend
+                                );
+                            }
+
+                            // take egui input
+                            let input = self.take_raw_input();
 
                             // prepare surface for drawing
                             gfx_backend.prepare_frame(
@@ -382,7 +405,7 @@ impl WinitBackend {
                         ]
                     };
 
-                    tracing::warn!("Resized {:?}", logical_size);
+                    tracing::warn!("Resized {:?}", size);
 
 
                     self.raw_input.screen_rect = Some(Rect::from_two_pos(
@@ -663,7 +686,7 @@ fn resize_canvas_to_parent(last_size: (i32, i32), canvas_id: &str /*, max_size_p
 
     // no change in resolution
     if last_size.0 == width && last_size.1 == height {
-        return Some((width, height));
+        return None;
     }
 
     tracing::info!("resize_canvas_to_parent {}, {}", width, height);

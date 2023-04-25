@@ -103,10 +103,10 @@ pub const RENDER_TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8
 
 const RENDER_TARGET_RECT: RenderTargetFullscreenRect =
     RenderTargetFullscreenRect {
-        margin_top: Percent(2.0),
-        margin_bottom: Percent(5.0),
-        margin_left: Percent(7.0),
-        margin_right: Percent(44.0),
+        margin_top: Percent(0.0),
+        margin_bottom: Percent(0.0),
+        margin_left: Percent(0.0),
+        margin_right: Percent(0.0),
     };
 
 pub const RENDER_TARGET_BINDGROUP_ENTRIES: [BindGroupLayoutEntry; 2] = [
@@ -249,7 +249,7 @@ impl WgpuBackend {
 
         let offscreen_render_target =
             if use_offscreen_render_target {
-                render_target_rect = Some(createRenderTargetRectFromScreenSize(
+                render_target_rect = Some(create_render_target_rect_from_screen_size(
                     surface_config.width,
                     surface_config.height
                 ));
@@ -357,6 +357,8 @@ impl WgpuBackend {
             surface_config.width = size[0];
             surface_config.height = size[1];
 
+            tracing::warn!("egui_render_wgpu::reconfigure_surface(): {}, {}", surface_config.width, surface_config.height);
+
             surface.as_ref().unwrap().configure(device, surface_config);
         }
     }
@@ -373,8 +375,8 @@ impl WgpuBackend {
         )
     }
 
-    pub fn createRenderTargetRectFromScreenSize(&self, screen_width: u32, screen_height: u32) -> RenderTargetRect {
-        createRenderTargetRectFromScreenSize(screen_width, screen_height)
+    pub fn create_render_target_rect_from_screen_size(&self, screen_width: u32, screen_height: u32) -> RenderTargetRect {
+        create_render_target_rect_from_screen_size(screen_width, screen_height)
     }
 }
 
@@ -409,6 +411,8 @@ impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
             &self.surface_formats_priority,
             &mut self.surface_config,
         );
+        tracing::warn!("egui_render_wgpu::resume(): {}, {}", self.surface_config.width, self.surface_config.height);
+
         self.painter
             .on_resume(&self.device, self.surface_config.format);
 
@@ -564,7 +568,7 @@ impl<W: WindowBackend> GfxBackend<W> for WgpuBackend {
     }
 
     fn updateRenderTargetRect(&mut self, screen_width: u32, screen_height: u32) -> (u32, u32) {
-        self.render_target_rect = Some(createRenderTargetRectFromScreenSize(screen_width, screen_height));
+        self.render_target_rect = Some(create_render_target_rect_from_screen_size(screen_width, screen_height));
         let rect = self.render_target_rect.as_ref().unwrap();
         (rect.width, rect.height)
     }
@@ -661,7 +665,7 @@ pub fn create_offscreen_render_target(
     })
 }
 
-pub fn createRenderTargetRectFromScreenSize(
+pub fn create_render_target_rect_from_screen_size(
     screen_width: u32,
     screen_height: u32
 ) -> RenderTargetRect {
