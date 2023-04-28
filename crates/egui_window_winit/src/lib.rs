@@ -68,6 +68,7 @@ pub struct WinitBackend {
     pub backend_config: BackendConfig,
     pub window_builder: WindowBuilder,
     pub winit_config: WinitConfig,
+    #[cfg(target_arch = "wasm32")]
     last_canvas_parent_size: (i32, i32),
 }
 
@@ -78,8 +79,8 @@ impl WindowBackend for WinitBackend {
     fn new(
         winit_config: Self::Configuration,
         backend_config: BackendConfig,
-        width: u32,
-        height: u32,
+        _width: u32,
+        _height: u32,
     ) -> Self {
         let mut event_loop_builder = winit::event_loop::EventLoopBuilder::with_user_event();
 
@@ -137,6 +138,7 @@ impl WindowBackend for WinitBackend {
         let scale = 1.0;
         let raw_input = RawInput::default();
 
+        #[cfg(target_arch = "wasm32")]
         let last_canvas_parent_size = resize_canvas_to_parent(
             (0, 0),
             winit_config.dom_element_id.as_ref().unwrap()
@@ -157,6 +159,7 @@ impl WindowBackend for WinitBackend {
             window_builder,
             pointer_touch_id: None,
             winit_config,
+            #[cfg(target_arch = "wasm32")]
             last_canvas_parent_size,
         }
     }
@@ -270,29 +273,30 @@ impl WindowBackend for WinitBackend {
                     }
                     event::Event::RedrawRequested(_) => {
                         if !suspended {
-                            tracing::info!("event::Event::RedrawRequested");
-
-                            let last_canvas_parent_size = resize_canvas_to_parent(
-                                self.last_canvas_parent_size,
-                                self.winit_config.dom_element_id.as_ref().unwrap()
-                            );
-
-                            if last_canvas_parent_size.is_some() {
-                                self.last_canvas_parent_size = last_canvas_parent_size.unwrap();
-                                let event = event::Event::WindowEvent{
-                                    window_id: self.window.as_ref().unwrap().id(),
-                                    event: event::WindowEvent::Resized(
-                                        PhysicalSize {
-                                            width: self.last_canvas_parent_size.0 as u32,
-                                            height: self.last_canvas_parent_size.1 as u32,
-                                        }
-                                    )
-                                };
-
-                                self.handle_event(
-                                    event,
-                                    &mut gfx_backend
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let last_canvas_parent_size = resize_canvas_to_parent(
+                                    self.last_canvas_parent_size,
+                                    self.winit_config.dom_element_id.as_ref().unwrap()
                                 );
+
+                                if last_canvas_parent_size.is_some() {
+                                    self.last_canvas_parent_size = last_canvas_parent_size.unwrap();
+                                    let event = event::Event::WindowEvent{
+                                        window_id: self.window.as_ref().unwrap().id(),
+                                        event: event::WindowEvent::Resized(
+                                            PhysicalSize {
+                                                width: self.last_canvas_parent_size.0 as u32,
+                                                height: self.last_canvas_parent_size.1 as u32,
+                                            }
+                                        )
+                                    };
+
+                                    self.handle_event(
+                                        event,
+                                        &mut gfx_backend
+                                    );
+                                }
                             }
 
                             // take egui input
@@ -677,6 +681,7 @@ fn winit_key_to_egui(key_code: VirtualKeyCode) -> Option<Key> {
     Some(key)
 }
 
+#[cfg(target_arch = "wasm32")]
 fn resize_canvas_to_parent(last_size: (i32, i32), canvas_id: &str /*, max_size_points: egui::Vec2*/) -> Option<(i32, i32)> {
     let canvas = canvas_element(canvas_id)?;
     let parent = canvas.parent_element()?;
@@ -735,6 +740,7 @@ fn resize_canvas_to_parent(last_size: (i32, i32), canvas_id: &str /*, max_size_p
     Some((width, height))
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn canvas_element(canvas_id: &str) -> Option<web_sys::HtmlCanvasElement> {
     use wasm_bindgen::JsCast;
     let document = web_sys::window()?.document()?;
@@ -742,6 +748,7 @@ pub fn canvas_element(canvas_id: &str) -> Option<web_sys::HtmlCanvasElement> {
     canvas.dyn_into::<web_sys::HtmlCanvasElement>().ok()
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn native_pixels_per_point() -> f32 {
     let pixels_per_point = web_sys::window().unwrap().device_pixel_ratio() as f32;
     if pixels_per_point > 0.0 && pixels_per_point.is_finite() {

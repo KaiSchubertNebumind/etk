@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use bytemuck::cast_slice;
 use egui_backend::egui::plot::Text;
 use std::borrow::Cow;
